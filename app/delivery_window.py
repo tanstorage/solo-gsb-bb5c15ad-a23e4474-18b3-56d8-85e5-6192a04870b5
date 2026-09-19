@@ -19,14 +19,20 @@ returns the earliest *future* opening instant. Both are evaluated against the
 real IANA zone database via :mod:`zoneinfo`, so daylight-saving transitions
 are handled from first principles:
 
-- membership at an instant is derived from the instant's *real* local wall
-  time, so spring-forward gaps are simply never "inside" and fall-back
-  repeats follow the actual clock (a wrap window ending inside the repeated
-  hour stays open until the second, real 02:00);
-- a scheduled opening whose nominal local time falls inside a spring-forward
-  gap resolves to the first real instant *after* the gap (the wall clock
-  jumped over the configured instant); an opening inside a repeated hour
-  resolves to the earlier of the two real instants.
+- every opening of the window is bound to one explicit UTC interval
+  ``[open_instant, close_instant)``: the open instant is the real moment the
+  configured start wall time first occurs on its local day, and the close
+  instant the real moment the configured end wall time first occurs on the
+  closing day. Membership is decided by those absolute instants, so a
+  fall-back repeated hour can never re-open or extend a window whose end
+  time has already passed once -- a Saturday 23:00 -> Sunday 01:30 window
+  in America/New_York closes at the *first* real 01:30, and the second
+  01:00-01:30 of the repeated hour stays closed;
+- a scheduled opening/closing whose nominal local time falls inside a
+  spring-forward gap resolves to the first real instant *after* the gap
+  (the wall clock jumped over the configured instant); one inside a
+  repeated hour resolves to the earlier of the two real instants
+  (``fold=0``).
 
 The module deliberately keeps no global mutable state (zone objects are
 cached read-only) and uses no process timers; callers persist the absolute
@@ -144,24 +150,43 @@ class DeliveryWindow:
         """True when the window opens on one day and closes on the next."""
         return self.local_end <= self.local_start
 
+    def _segment_bounds(self, day) -> tuple[float, float]:
+        """Absolute UTC instants ``[open, close)`` of the segment opening on ``day``.
+
+        ``day`` is the local date whose midnight anchors ``local_start``; the
+        close is anchored on the following local day for wrap windows. Both
+        instants resolve through the real tzdb (first occurrence for repeated
+        wall times, first real instant after a gap), so the interval is
+        immune to the fall-back repeat: the second pass of the end wall time
+        lies outside ``[open, close)``.
+        """
+        zone = self.zone
+        close_day = day + timedelta(days=1) if self.wraps_past_midnight else day
+        return (
+            _open_instant(day, self.local_start, zone),
+            _open_instant(close_day, self.local_end, zone),
+        )
+
     def is_open(self, ts: float) -> bool:
-        """Whether the window is open at the given epoch second."""
-        local = datetime.fromtimestamp(ts, self.zone)
-        seconds = local.hour * 3600 + local.minute * 60 + local.second + local.microsecond / 1_000_000
-        weekday = local.isoweekday()
-        if weekday in self.weekdays:
-            if self.wraps_past_midnight:
-                # The segment anchored on *this* weekday opens at local_start
-                # and runs until midnight; its post-midnight tail is covered
-                # by the previous-weekday check below.
-                if seconds >= self.local_start:
-                    return True
-            elif self.local_start <= seconds < self.local_end:
+        """Whether the window is open at the given epoch second.
+
+        The instant is tested against the explicit UTC interval of each
+        candidate segment -- the one opening on the instant's own local day
+        and, for wrap windows, the tail of the one that opened on the
+        previous local day. Because the close bound is the *first* real
+        occurrence of the end wall time, a window whose end falls inside a
+        fall-back repeated hour closes at that first occurrence and does not
+        re-open during the second pass of the repeated hour.
+        """
+        today = datetime.fromtimestamp(ts, self.zone).date()
+        if today.isoweekday() in self.weekdays:
+            opens, closes = self._segment_bounds(today)
+            if opens <= ts < closes:
                 return True
-        if self.wraps_past_midnight and (weekday - 2) % 7 + 1 in self.weekdays:
-            # Before local_end on this weekday we are inside the tail of the
-            # window that opened on the previous calendar day.
-            if seconds < self.local_end:
+        if self.wraps_past_midnight and (today.isoweekday() - 2) % 7 + 1 in self.weekdays:
+            # Tail of the segment that opened on the previous local day.
+            opens, closes = self._segment_bounds(today - timedelta(days=1))
+            if opens <= ts < closes:
                 return True
         return False
 

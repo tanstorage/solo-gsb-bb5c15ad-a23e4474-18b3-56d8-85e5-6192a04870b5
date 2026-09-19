@@ -1,0 +1,4 @@
+# Development-only dependencies (tests). The production image installs only
+# requirements.txt, so the Docker image stays unchanged.
+-r requirements.txt
+pytest>=8.0,<10.0
