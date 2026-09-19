@@ -15,18 +15,23 @@ closes on the following calendar day at ``local_end``.
 
 All computations are pure functions over epoch seconds plus the (immutable)
 window configuration: ``is_open`` answers for one instant, and ``next_open``
-returns the earliest *future* opening instant. Both are evaluated against the
-real IANA zone database via :mod:`zoneinfo`, so daylight-saving transitions
-are handled from first principles:
+returns the earliest *future* opening instant. Both share one determination:
+every opening of the window is a single concrete UTC interval
+``[open, close)`` whose anchors are resolved against the real IANA zone
+database via :mod:`zoneinfo`, so daylight-saving transitions are handled
+from first principles:
 
-- membership at an instant is derived from the instant's *real* local wall
-  time, so spring-forward gaps are simply never "inside" and fall-back
-  repeats follow the actual clock (a wrap window ending inside the repeated
-  hour stays open until the second, real 02:00);
-- a scheduled opening whose nominal local time falls inside a spring-forward
-  gap resolves to the first real instant *after* the gap (the wall clock
-  jumped over the configured instant); an opening inside a repeated hour
-  resolves to the earlier of the two real instants.
+- each anchor resolves to a *real* instant: an ordinary local time maps
+  directly, a local time inside a fall-back repeated hour maps to its first
+  occurrence (``fold=0``), and a local time inside a spring-forward gap
+  maps to the first real instant at or after it (the wall clock jumped
+  straight over the configured time);
+- because one opening is bound to those absolute instants, a window whose
+  end falls inside a fall-back repeated hour closes at the *first*
+  occurrence of the end time -- the second pass of the repeated wall-clock
+  hour neither reopens nor extends the interval;
+- a spring-forward gap is simply never "inside" the interval, and a window
+  whose whole span falls inside a gap never opens that day.
 
 The module deliberately keeps no global mutable state (zone objects are
 cached read-only) and uses no process timers; callers persist the absolute
@@ -123,6 +128,12 @@ def _open_instant(day, seconds_after_midnight: int, zone: ZoneInfo) -> float:
             high = mid
         else:
             low = mid
+    # tzdb transitions fall on whole seconds, and the bisection lands within
+    # a microsecond of the true boundary, so rounding recovers the exact
+    # transition instant; the raw bound is only a defensive fallback.
+    snapped = round(high)
+    if datetime.fromtimestamp(snapped, zone).replace(tzinfo=None) >= naive:
+        return float(snapped)
     return high
 
 
@@ -144,24 +155,46 @@ class DeliveryWindow:
         """True when the window opens on one day and closes on the next."""
         return self.local_end <= self.local_start
 
+    def _interval(self, anchor) -> tuple[float, float]:
+        """UTC ``[open, close)`` instants of the segment opening on ``anchor``.
+
+        ``anchor`` is the local ``date`` whose ``local_start`` opens the
+        segment; the close anchor is ``local_end`` on the same local day, or
+        on the following one when the window wraps past midnight. Both
+        anchors resolve through :func:`_open_instant`, so the interval is
+        always a pair of real, absolute instants -- most notably, a close
+        time inside a fall-back repeated hour binds to its first occurrence.
+        """
+        zone = self.zone
+        opens = _open_instant(anchor, self.local_start, zone)
+        close_day = anchor + timedelta(days=1) if self.wraps_past_midnight else anchor
+        closes = _open_instant(close_day, self.local_end, zone)
+        return opens, closes
+
     def is_open(self, ts: float) -> bool:
-        """Whether the window is open at the given epoch second."""
-        local = datetime.fromtimestamp(ts, self.zone)
-        seconds = local.hour * 3600 + local.minute * 60 + local.second + local.microsecond / 1_000_000
-        weekday = local.isoweekday()
-        if weekday in self.weekdays:
-            if self.wraps_past_midnight:
-                # The segment anchored on *this* weekday opens at local_start
-                # and runs until midnight; its post-midnight tail is covered
-                # by the previous-weekday check below.
-                if seconds >= self.local_start:
-                    return True
-            elif self.local_start <= seconds < self.local_end:
-                return True
-        if self.wraps_past_midnight and (weekday - 2) % 7 + 1 in self.weekdays:
-            # Before local_end on this weekday we are inside the tail of the
-            # window that opened on the previous calendar day.
-            if seconds < self.local_end:
+        """Whether the window is open at the given epoch second.
+
+        One opening is a single concrete UTC interval ``[open, close)`` (see
+        :meth:`_interval`) and membership is decided by absolute-instant
+        comparison, so a fall-back repeated hour cannot reopen or extend a
+        window whose end falls inside it: the interval closes at the first
+        occurrence of the end time and the second pass of the repeated
+        wall-clock hour stays closed. Only two segments can contain ``ts``:
+        the one anchored on the instant's own local date and, for wrap
+        windows (whose tail crosses midnight), the one anchored on the
+        previous local date -- which keeps the tail attributed to the
+        weekday the window opened on.
+        """
+        zone = self.zone
+        local_date = datetime.fromtimestamp(ts, zone).date()
+        for days_back in (0, 1):
+            if days_back and not self.wraps_past_midnight:
+                break
+            anchor = local_date - timedelta(days=days_back)
+            if anchor.isoweekday() not in self.weekdays:
+                continue
+            opens, closes = self._interval(anchor)
+            if opens <= ts < closes:
                 return True
         return False
 
@@ -170,8 +203,12 @@ class DeliveryWindow:
 
         Precondition: the window is closed at ``ts`` (callers gate on
         :meth:`is_open` first). The next opening is the start of an allowed
-        weekday's segment that is not already in the past; at most the next
-        seven calendar days need inspecting because ``weekdays`` is non-empty.
+        weekday's segment whose interval is not already in the past; at most
+        the next seven calendar days need inspecting because ``weekdays`` is
+        non-empty. A segment whose interval is empty (its whole span falls
+        inside a spring-forward gap) never opens and is skipped, so the
+        result is always an instant at which :meth:`is_open` turns true --
+        the exact same determination the worker's atomic claim applies.
         """
         zone = self.zone
         base_date = datetime.fromtimestamp(ts, zone).date()
@@ -180,7 +217,7 @@ class DeliveryWindow:
             day = base_date + timedelta(days=delta)
             if day.isoweekday() not in self.weekdays:
                 continue
-            opens_at = _open_instant(day, self.local_start, zone)
-            if opens_at >= ts:
-                candidates.append(opens_at)
+            opens, closes = self._interval(day)
+            if opens >= ts and closes > opens:
+                candidates.append(opens)
         return min(candidates)
